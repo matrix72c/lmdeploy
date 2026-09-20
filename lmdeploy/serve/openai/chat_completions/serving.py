@@ -149,6 +149,22 @@ def register(router: APIRouter, server_context) -> None:
                 json_request,
             )
 
+        # Agents replaying OpenAI-compatible transcripts commonly inject
+        # system messages mid-conversation (e.g. Claude Code's environment
+        # reminders). Templates that require system-at-the-front (Qwen3.5)
+        # reject such histories outright, so hoist system messages to the
+        # front and concatenate their contents -- the same normalization the
+        # anthropic router applies (adapter._merge_system_messages).
+        if request.messages:
+            hoisted = [m for m in request.messages if m.get('role') == 'system']
+            if hoisted and any(m.get('role') == 'system' for m in request.messages[1:]):
+                others = [m for m in request.messages if m.get('role') != 'system']
+                merged_content = '\n\n'.join(
+                    str(m.get('content') or '') for m in hoisted if m.get('content')
+                )
+                merged = [dict(role='system', content=merged_content)] if merged_content else []
+                request = request.model_copy(update={'messages': merged + others})
+
         # Resolve input: messages has priority over input_ids/image_data
         messages_empty = request.messages is None or len(request.messages) == 0
         resolved_input_ids = None
