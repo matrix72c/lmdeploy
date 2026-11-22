@@ -403,8 +403,10 @@ def serve(model_path: str,
                                  backend_config=backend_config)
     if isinstance(backend_config, PytorchEngineConfig):
         backend_config.enable_mp_engine = True
-        # router replay
-        if backend_config.enable_return_routed_experts:
+        # router replay. A caller outside this Ray cluster (e.g. a gateway that reads the
+        # /generate response) cannot dereference object-store keys; it opts into inline
+        # expert ids with LMDEPLOY_INLINE_ROUTED_EXPERTS=1.
+        if backend_config.enable_return_routed_experts and os.getenv('LMDEPLOY_INLINE_ROUTED_EXPERTS') != '1':
             backend_config.enable_transfer_obj_ref = True
     server_context.async_engine = pipeline_class(
         model_path=model_path,
