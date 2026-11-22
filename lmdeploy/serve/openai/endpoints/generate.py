@@ -55,6 +55,46 @@ def _create_top_logprobs(token_ids: list[int] | None = None,
     return top_logprobs or None
 
 
+def _check_disaggregation(request: GenerateReqInput, engine_config) -> str:
+    """Validate the PD disaggregation fields of a /generate request.
+
+    Prefill side: ``with_cache`` (and usually ``preserve_cache``) returns the
+    KV cache handle in the response. Decode side: ``migration_request`` pulls
+    that cache; the decode output starts with the prefill's sampled token.
+    """
+    if not (request.with_cache or request.preserve_cache or request.migration_request is not None):
+        return ''
+    if not isinstance(engine_config, PytorchEngineConfig):
+        return 'with_cache, preserve_cache and migration_request require the PyTorch engine.'
+    if request.preserve_cache and not request.with_cache:
+        return 'preserve_cache requires with_cache=True.'
+    if request.with_cache and request.migration_request is not None:
+        return 'with_cache and migration_request cannot be used in the same request.'
+    if request.with_cache and request.stream:
+        return 'with_cache is not supported with stream=True.'
+    if request.logprob_start_len >= 0:
+        return 'logprob_start_len is not supported with cache migration.'
+    if request.image_data is not None:
+        return 'image_data is not supported with cache migration.'
+    if request.input_ids is None:
+        return 'cache migration requires input_ids.'
+    if (request.migration_request is not None and request.return_routed_experts
+            and request.routed_experts_start_len != len(request.input_ids)):
+        # The decode engine computes positions from len(input_ids) on: the
+        # prompt routes come from the prefill response.
+        return 'migration_request with return_routed_experts requires routed_experts_start_len=len(input_ids).'
+    return ''
+
+
+def _split_migrated_token(output_ids: list[int], migrated: bool) -> list[int]:
+    """Output ids this engine sampled itself.
+
+    A decode request (``migration_request``) first emits the prefill's sampled
+    token; it was not sampled here and carries no logprob.
+    """
+    return output_ids[1:] if migrated and output_ids else output_ids
+
+
 def check_request(request: GenerateReqInput, server_context) -> str:
     engine_config = server_context.engine_config
     session_manager = server_context.session_manager
@@ -102,6 +142,10 @@ def check_request(request: GenerateReqInput, server_context) -> str:
     elif request.max_tokens is not None and request.max_tokens == 0:
         return f'The max_tokens {request.max_tokens!r} must be a positive integer.'
 
+    pd_error = _check_disaggregation(request, engine_config)
+    if pd_error:
+        return pd_error
+
     if session_manager.has(request.session_id):
         return f'The session_id {request.session_id!r} is occupied.'
 
@@ -146,12 +190,16 @@ def register(router: APIRouter, server_context) -> None:
             input_ids = None
 
         gen_logprobs = (request.top_logprobs_num or 1) if request.return_logprob else None
+        migrated = request.migration_request is not None
         gen_config = build_serving_generation_config(
             request,
             server_context,
             logprobs=gen_logprobs,
             logprob_start_len=request.logprob_start_len,
             stop_words=request.stop,
+            migration_request=request.migration_request,
+            with_cache=request.with_cache,
+            preserve_cache=request.preserve_cache,
         )
 
         session = server_context.create_session(request.session_id)
@@ -196,6 +244,7 @@ def register(router: APIRouter, server_context) -> None:
             return response.model_dump_json()
 
         async def generate_stream_generator():
+            migrated_pending = migrated
             try:
                 async for res in result_generator:
                     text = res.response or ''
@@ -210,8 +259,12 @@ def register(router: APIRouter, server_context) -> None:
                                                                    request.top_logprobs_num)
                                               if request.top_logprobs_num else None)
                     else:
-                        logprobs = _create_token_logprobs(res.token_ids, res.logprobs)
-                        top_logprobs = (_create_top_logprobs(res.token_ids, res.logprobs, request.top_logprobs_num)
+                        sampled_ids = res.token_ids
+                        if migrated_pending and sampled_ids:
+                            # The migrated token may share a chunk with the first local sample.
+                            sampled_ids, migrated_pending = sampled_ids[1:], False
+                        logprobs = _create_token_logprobs(sampled_ids, res.logprobs)
+                        top_logprobs = (_create_top_logprobs(sampled_ids, res.logprobs, request.top_logprobs_num)
                                         if request.top_logprobs_num else None)
                         input_logprobs = None
                         input_top_logprobs = None
@@ -245,6 +298,7 @@ def register(router: APIRouter, server_context) -> None:
             input_token_logprobs = None
             input_top_logprobs = None
             input_logprob_token_ids = None
+            cache_block_ids = None
             try:
                 async with aclosing(
                         with_request_cleanup(
@@ -258,6 +312,8 @@ def register(router: APIRouter, server_context) -> None:
                                                          'Client disconnected')
                         text += res.response or ''
                         output_ids.extend(res.token_ids or [])
+                        if request.with_cache and res.cache_block_ids is not None:
+                            cache_block_ids = res.cache_block_ids
                         if input_logprobs_requested:
                             input_logprob_token_ids = res.logprob_token_ids
                             if res.logprobs:
@@ -267,8 +323,9 @@ def register(router: APIRouter, server_context) -> None:
             except RequestError as e:
                 return create_request_error_response(e)
 
-            output_token_logprobs = _create_token_logprobs(output_ids, logprobs) if logprobs else None
-            output_top_logprobs = (_create_top_logprobs(output_ids, logprobs, request.top_logprobs_num)
+            sampled_ids = _split_migrated_token(output_ids, migrated)
+            output_token_logprobs = _create_token_logprobs(sampled_ids, logprobs) if logprobs else None
+            output_top_logprobs = (_create_top_logprobs(sampled_ids, logprobs, request.top_logprobs_num)
                                    if request.top_logprobs_num and logprobs else None)
             if input_logprobs_requested and input_logprobs:
                 input_token_logprobs = _create_token_logprobs(input_logprob_token_ids, input_logprobs)
@@ -286,8 +343,14 @@ def register(router: APIRouter, server_context) -> None:
                 prompt_tokens=res.input_token_len,
                 routed_experts=res.routed_experts,
                 completion_tokens=res.generate_token_len)
-            return GenerateReqOutput(text=text,
-                                     output_ids=output_ids,
-                                     meta_info=meta)
+            response = GenerateReqOutput(text=text,
+                                         output_ids=output_ids,
+                                         meta_info=meta)
+            if request.with_cache:
+                # Cache ownership uses the engine session, not the request's session_id.
+                response.cache_session_id = session.session_id
+                response.cache_block_ids = cache_block_ids or []
+                response.remote_token_ids = output_ids[-1:]
+            return response
 
         return await _inner_call()

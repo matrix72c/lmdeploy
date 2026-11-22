@@ -257,6 +257,10 @@ class BlockTrie:
         """Get a copy of routed experts for a full token range, if present."""
         if not seq.return_routed_experts:
             return None
+        if seq.migration_request is not None and start < seq.output_start_pos:
+            # A migrated prompt was computed by the prefill engine; its rows
+            # here are placeholders and must not enter the cache.
+            return None
         all_routed_experts = seq.all_routed_experts
         if all_routed_experts is None:
             return None

@@ -790,7 +790,26 @@ class SchedulerSequence:
             return
         if isinstance(routed_experts, Tensor):
             routed_experts = routed_experts.cpu().numpy()
+        if self.migration_request is not None:
+            self._pad_migrated_routed_experts(routed_experts)
         self.all_routed_experts.append(routed_experts)
+
+    def _pad_migrated_routed_experts(self, routed_experts: np.ndarray):
+        """Keep routed experts indexed by absolute position after migration.
+
+        A migrated (PD decode) sequence received the KV cache of its prompt
+        ``[0, output_start_pos)`` from the prefill engine, so those positions
+        were never computed here. Before the first local rows are appended
+        they get zero placeholder rows; /generate only returns rows from the
+        prompt length on, i.e. the positions this engine computed. The pad is
+        bounded by ``num_history_ids`` (first position of the rows being
+        appended on a prefill-mode step) so a recompute after preemption,
+        which appends real rows from its restart step, is not padded.
+        """
+        missing = min(self.num_history_ids, self.output_start_pos) - len(self.all_routed_experts)
+        if missing > 0:
+            pad = np.zeros((missing, *routed_experts.shape[1:]), dtype=routed_experts.dtype)
+            self.all_routed_experts.append(pad)
 
     @property
     def num_history_ids(self):

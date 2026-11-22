@@ -7,6 +7,8 @@ from typing import Any, Literal
 import shortuuid
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
+from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
+
 
 class ErrorResponse(BaseModel):
     """Error responses."""
@@ -648,6 +650,12 @@ class GenerateReqInput(BaseModel):
         default=None,
         description=('Additional kwargs to pass to the HF processor'),
     )
+    # PD disaggregation. Prefill side: ``with_cache`` returns the KV cache
+    # handle, ``preserve_cache`` keeps it until the decode side frees it.
+    # Decode side: ``migration_request`` pulls the prefill KV cache.
+    with_cache: bool = False
+    preserve_cache: bool = False
+    migration_request: MigrationRequest | None = None
 
 
 class GenerateReqMetaOutput(BaseModel):
@@ -666,6 +674,11 @@ class GenerateReqOutput(BaseModel):
     text: str
     output_ids: list[int]
     meta_info: GenerateReqMetaOutput
+    # PD prefill (``with_cache``): engine session owning the cache, its
+    # blocks and the sampled first token, as passed to ``MigrationRequest``.
+    cache_session_id: int | None = None
+    cache_block_ids: list[int] | None = None
+    remote_token_ids: list[int] | None = None
 
 
 class AbortRequest(BaseModel):
