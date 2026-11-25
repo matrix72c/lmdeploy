@@ -1,14 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from __future__ import annotations
 
+import base64
 import json
 from contextlib import aclosing
 from http import HTTPStatus
 
+import numpy as np
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from lmdeploy.messages import PytorchEngineConfig
+from lmdeploy.messages import LogprobArrays, PytorchEngineConfig
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.serve.core.exceptions import RequestError
 from lmdeploy.serve.openai.endpoints.common import build_serving_generation_config, validate_request
@@ -18,6 +20,7 @@ from lmdeploy.serve.openai.errors import (
     request_error_payload,
 )
 from lmdeploy.serve.openai.protocol import (
+    GenerateReqFlatMetaOutput,
     GenerateReqInput,
     GenerateReqMetaOutput,
     GenerateReqOutput,
@@ -53,6 +56,29 @@ def _create_top_logprobs(token_ids: list[int] | None = None,
         items.sort(key=lambda x: x[0], reverse=True)
         top_logprobs.append(items[:top_logprobs_num])
     return top_logprobs or None
+
+
+def _create_token_logprobs_from_arrays(token_ids: list[int] | None = None,
+                                      logprobs: LogprobArrays | None = None):
+    """Create raw (logprob, token_id) pairs from array rows."""
+    if token_ids is None or logprobs is None:
+        return None
+    if len(token_ids) != len(logprobs):
+        raise ValueError(f'{len(token_ids)} token ids but {len(logprobs)} logprob rows')
+    return list(zip(logprobs.vals[:, 0].tolist(), token_ids)) or None
+
+
+def _create_flat_top_logprobs(logprobs: LogprobArrays | None = None, top_logprobs_num: int = 0):
+    """Encode the top-k columns of array rows as base64 little-endian
+    arrays."""
+    if logprobs is None or len(logprobs) == 0 or top_logprobs_num <= 0:
+        return None
+    # Column 0 is the sampled token, already in output_token_logprobs.
+    ids = np.ascontiguousarray(logprobs.ids[:, 1:top_logprobs_num + 1], dtype='<i4')
+    vals = np.ascontiguousarray(logprobs.vals[:, 1:top_logprobs_num + 1], dtype='<f4')
+    return dict(output_top_logprobs_shape=list(ids.shape),
+                output_top_logprobs_ids_b64=base64.b64encode(ids.tobytes()).decode('ascii'),
+                output_top_logprobs_b64=base64.b64encode(vals.tobytes()).decode('ascii'))
 
 
 def _check_disaggregation(request: GenerateReqInput, engine_config) -> str:
@@ -105,6 +131,11 @@ def check_request(request: GenerateReqInput, server_context) -> str:
         return f'The top_logprobs_num {request.top_logprobs_num!r} cannot be a negative integer.'
     if top_logprobs_num > 0 and return_logprob is not True:
         return 'top_logprobs_num requires return_logprob=True.'
+    if request.top_logprobs_format == 'flat':
+        if not isinstance(engine_config, PytorchEngineConfig):
+            return "top_logprobs_format='flat' requires the PyTorch engine."
+        if request.logprob_start_len >= 0:
+            return "top_logprobs_format='flat' does not support logprob_start_len."
     if hasattr(engine_config, 'logprobs_mode') and logprobs_mode is None and return_logprob:
         return f'return_logprob({return_logprob}) requested but not enabled logprobs_mode in engine configuration.'
 
@@ -172,6 +203,8 @@ def register(router: APIRouter, server_context) -> None:
         prompt = request.prompt
         input_ids = request.input_ids
         input_logprobs_requested = request.logprob_start_len >= 0
+        flat = request.top_logprobs_format == 'flat'
+        meta_cls = GenerateReqFlatMetaOutput if flat else GenerateReqMetaOutput
         image_data = request.image_data
         if image_data is not None:
             # convert to openai format
@@ -196,6 +229,7 @@ def register(router: APIRouter, server_context) -> None:
             server_context,
             logprobs=gen_logprobs,
             logprob_start_len=request.logprob_start_len,
+            logprobs_format='array' if flat else 'dict',
             stop_words=request.stop,
             migration_request=request.migration_request,
             with_cache=request.with_cache,
@@ -224,10 +258,11 @@ def register(router: APIRouter, server_context) -> None:
                                           top_logprobs,
                                           input_top_logprobs,
                                           finish_reason,
-                                          routed_experts=None):
+                                          routed_experts=None,
+                                          flat_top_logprobs=None):
             # only output router experts in last chunk
             routed_experts = None if finish_reason is None else routed_experts
-            meta = GenerateReqMetaOutput(
+            meta = meta_cls(
                 finish_reason=dict(
                     type=finish_reason) if finish_reason else None,
                 output_token_logprobs=logprobs,
@@ -236,7 +271,8 @@ def register(router: APIRouter, server_context) -> None:
                 input_top_logprobs=input_top_logprobs,
                 prompt_tokens=res.input_token_len,
                 routed_experts=routed_experts,
-                completion_tokens=res.generate_token_len)
+                completion_tokens=res.generate_token_len,
+                **(flat_top_logprobs or {}))
 
             response = GenerateReqOutput(text=text,
                                          output_ids=output_ids,
@@ -250,6 +286,7 @@ def register(router: APIRouter, server_context) -> None:
                     text = res.response or ''
                     output_ids = res.token_ids
                     routed_experts = res.routed_experts
+                    flat_top_logprobs = None
                     if input_logprobs_requested:
                         input_logprob_token_ids = res.logprob_token_ids
                         logprobs = None
@@ -263,9 +300,14 @@ def register(router: APIRouter, server_context) -> None:
                         if migrated_pending and sampled_ids:
                             # The migrated token may share a chunk with the first local sample.
                             sampled_ids, migrated_pending = sampled_ids[1:], False
-                        logprobs = _create_token_logprobs(sampled_ids, res.logprobs)
-                        top_logprobs = (_create_top_logprobs(sampled_ids, res.logprobs, request.top_logprobs_num)
-                                        if request.top_logprobs_num else None)
+                        if flat:
+                            logprobs = _create_token_logprobs_from_arrays(sampled_ids, res.logprobs)
+                            top_logprobs = None
+                            flat_top_logprobs = _create_flat_top_logprobs(res.logprobs, request.top_logprobs_num or 0)
+                        else:
+                            logprobs = _create_token_logprobs(sampled_ids, res.logprobs)
+                            top_logprobs = (_create_top_logprobs(sampled_ids, res.logprobs, request.top_logprobs_num)
+                                            if request.top_logprobs_num else None)
                         input_logprobs = None
                         input_top_logprobs = None
                     response_json = create_generate_response_json(
@@ -277,7 +319,8 @@ def register(router: APIRouter, server_context) -> None:
                         top_logprobs,
                         input_top_logprobs,
                         res.finish_reason,
-                        routed_experts=routed_experts)
+                        routed_experts=routed_experts,
+                        flat_top_logprobs=flat_top_logprobs)
                     yield f'data: {response_json}\n\n'
             except RequestError as e:
                 yield f'data: {json.dumps({"error": request_error_payload(e)}, ensure_ascii=False)}\n\n'
@@ -319,21 +362,31 @@ def register(router: APIRouter, server_context) -> None:
                             if res.logprobs:
                                 input_logprobs = res.logprobs
                         elif res.logprobs:
-                            logprobs.extend(res.logprobs)
+                            if flat:
+                                logprobs.append(res.logprobs)
+                            else:
+                                logprobs.extend(res.logprobs)
             except RequestError as e:
                 return create_request_error_response(e)
 
             sampled_ids = _split_migrated_token(output_ids, migrated)
-            output_token_logprobs = _create_token_logprobs(sampled_ids, logprobs) if logprobs else None
-            output_top_logprobs = (_create_top_logprobs(sampled_ids, logprobs, request.top_logprobs_num)
-                                   if request.top_logprobs_num and logprobs else None)
+            flat_top_logprobs = None
+            if flat:
+                rows = LogprobArrays.concat(logprobs) if logprobs else None
+                output_token_logprobs = _create_token_logprobs_from_arrays(sampled_ids, rows)
+                output_top_logprobs = None
+                flat_top_logprobs = _create_flat_top_logprobs(rows, request.top_logprobs_num or 0)
+            else:
+                output_token_logprobs = _create_token_logprobs(sampled_ids, logprobs) if logprobs else None
+                output_top_logprobs = (_create_top_logprobs(sampled_ids, logprobs, request.top_logprobs_num)
+                                       if request.top_logprobs_num and logprobs else None)
             if input_logprobs_requested and input_logprobs:
                 input_token_logprobs = _create_token_logprobs(input_logprob_token_ids, input_logprobs)
                 input_top_logprobs = (_create_top_logprobs(input_logprob_token_ids, input_logprobs,
                                                            request.top_logprobs_num)
                                       if request.top_logprobs_num else None)
 
-            meta = GenerateReqMetaOutput(
+            meta = meta_cls(
                 finish_reason=dict(
                     type=res.finish_reason) if res.finish_reason else None,
                 output_token_logprobs=output_token_logprobs or None,
@@ -342,7 +395,8 @@ def register(router: APIRouter, server_context) -> None:
                 input_top_logprobs=input_top_logprobs,
                 prompt_tokens=res.input_token_len,
                 routed_experts=res.routed_experts,
-                completion_tokens=res.generate_token_len)
+                completion_tokens=res.generate_token_len,
+                **(flat_top_logprobs or {}))
             response = GenerateReqOutput(text=text,
                                          output_ids=output_ids,
                                          meta_info=meta)
